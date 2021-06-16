@@ -1,0 +1,326 @@
+---
+title: Zillow API Caller
+author: Peter Scarbrough
+date: 2021-01-09
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+
+# Loading Required Packages
+
+```{r load.packages, message=F, warning=F}
+library(plyr)
+library(tidyverse)
+library(knitr)
+library(ZillowR)
+library(XML)
+library(corrplot)
+library(DT)
+library(caret)
+library(lubridate)
+```
+
+```{r define.constants}
+#my.zid = "X1-ZWz1hftprhh5vv_70ucn" #Peter's
+my.zid = "X1-ZWz16ujdk3jbpn_7zykg" #Katherine's
+```
+
+# Load Address Data
+
+```{r}
+setwd("C:/Users/Katherine/Desktop/RealEstateResearch")
+filename = "gwinnett-county-ga-addresses-PARSED.csv"
+
+a.data = read_csv(filename)
+
+
+# clean data
+a.data$ADDRESS <- toupper(a.data$ADDRESS)
+#a.data$`HOA/MONTH`[a.data$`HOA/MONTH` %>% is.na] <- 0
+a.data$`ZIP OR POSTAL CODE` <- as.character(a.data$`ZIP OR POSTAL CODE`)
+#a.data$PRICE = a.data$'List Price'
+#a.data$'DAYS ON MARKET' = a.data$`Total Days on Market`
+write.csv(a.data[,c('ADDRESS', 'ZIP OR POSTAL CODE')], 'temp.csv')
+
+a.data <- read_csv('temp.csv')
+a.data$Unnamed <- NULL
+a.data$X1 <- NULL
+a.data$'ZIP OR POSTAL CODE' <- as.character(a.data$'ZIP OR POSTAL CODE')
+
+n = nrow(a.data)
+usei = sample(1:n, size=950, replace=F)
+#backup.a.data = a.data
+a.data = a.data[usei,]
+
+# get pilot data to test zillow query/parsing function
+a.test <- a.data[1:2,]
+```
+
+Alternative source... using the open address data
+
+```{r}
+# filename = "ga_all_addresses.csv"
+# cityname = "TUCKER"
+# 
+# a.data = read_csv(filename, col_types = cols(.default = "c"))
+# a.data = a.data %>% filter(CITY == cityname)
+# 
+# # get random sample of 900 addresses
+# n = dim(a.data)[1]
+# possible_rows = 1:n
+# selected_rows = sample(possible_rows, size=900, replace=F)
+# a.data = a.data[selected_rows,]
+# 
+# a.test <- a.data[1:2,]
+```
+
+# Zillow API Functions
+
+```{r}
+# define function: getRegionData
+# purpose: Zillow `Region Name` and `Region Type` variables 
+#          are contained within an XML tag and thus must be
+#          read through a special parsing function separate
+#          from the main XML parsing algorithm
+# arguments (1): 
+#   1. 'listData': list of xml node data [list]
+# returns: 2-item list:
+#   1. `region.name`: region name [character]
+#   2. `region.type`: region type [character]
+getRegionData <- function(listData){
+  # get region node from xml list
+  regionNode <- listData$localRealEstate$region
+  
+  # return missing data if no data
+  if(is.null(regionNode)){
+    return(list(.region.name=NA,
+                .region.type=NA))
+  }
+  
+  # convert chr data to regular vector
+  chrData <- as.character(regionNode)[2]
+  chrData <- eval(parse(text=chrData))
+  
+  # if NULL data, replace with NA
+  chrNames <- names(chrData)
+  if(!("name" %in% chrNames)) chrData[["name"]] <- NA
+  if(!("type" %in% chrNames)) chrData[["type"]] <- NA
+  
+  # return list with region data
+  return(list(.region.name=chrData[["name"]],
+              .region.type=chrData[["type"]]))
+}
+
+# define function: leftListMerge
+# purpose: similar concept to left_join but works with lists.
+#          Left list argument is used to merge and overwrite 
+#          any values on right list
+# arguments (2):
+#   1. `l1`: left list to merge  [list]
+#   2. `l2`: right list to merge [list]
+#   note: all list items are expected to be named
+# returns: `newl`: merged list   [list]
+leftListMerge <- function(l1, l2){
+  newl <- list()
+  for(j in names(l2)){
+    newl[[j]] <- l2[[j]]
+  }
+  for(j in names(l1)){
+    newl[[j]] <- l1[[j]]
+  }
+  newl
+}
+
+# define recursive function: parseXML
+# purpose: recursively reads through XML tree file
+#          merges names by tree level, combines/returns list
+# description: pulls XML values from XML tags stored in the 
+#              list object
+# arguments (2):
+#   1. `xmlData`:   XMLNode object to be parsed [list]
+#   2. `varPrefix`: variable name to merge into (create) new variable names
+#                   ***only intended for recursive function use!***
+#                   basically keeps track of variable name path during 
+#                   recusrive function calls
+#                   [character]
+# returns: list of parsed xml data [n-length named list]
+#          n=number of variables parsed from XML file
+#          note: all variable types = character
+parseXMLList <- function(listData, currentName=""){
+  # initialize results
+  res <- list()
+  
+  # get region data, do only once
+  if(currentName == ""){
+    rList <- getRegionData(listData)
+    res <- leftListMerge(rList, res)
+  }
+  
+  # get variable names for node
+  varNames <- names(listData)
+  
+  # if just one node, grab data
+  if(length(varNames) == 1 & currentName != ".localRealEstate"){
+    res[[currentName]] <- xmlValue(listData[[varNames]])
+  }
+
+  # if multiple nodes, recursively call this function
+  else{
+    for(v in varNames){
+      newName <- paste(currentName, v, sep=".")
+      tempRes     <- parseXMLList(listData[[v]], newName)
+      res <- leftListMerge(tempRes, res)
+    }
+  }
+  
+  # return result
+  return(res)
+}
+
+# define function: detectFixType
+# purpose: uses try/catch logic to guess variable type
+#          uses this set the variable type of a vector
+# arguments (1):
+#   `a`: a vector of data [numeric or character vector]
+# returns: potentially modified vector 
+#         [numeric or character vector]
+detectFixType <- function(a){
+   tryCatch(
+     {as.numeric(a)},
+     error=function(x){
+       return(as.character(a))
+       },
+     warning=function(x){
+       return(as.character(a))
+       },
+     finally=function(x){
+       return(as.numeric(a))
+     }
+     ) 
+}
+
+# define function: getZillowData
+# purpose: queries Zillow API with address data
+#          parses each Zillow result, if available, 
+#          merges each query to final data.frame
+#          keeps variables specified by assignment
+# arguments (1):
+#   `addr`: data frame from parsed csv file
+# returns: Zillow data set for available addresses [data.frame]
+getZillowData <- function(addr){
+  res <- data.frame()
+  
+  for(i in seq_along(1:nrow(addr))){
+    # query zillow server, save list object
+    zData <- GetDeepSearchResults(address = addr$ADDRESS[i],
+                              citystatezip = addr$`ZIP OR POSTAL CODE`[i],
+                              rentzestimate=T,
+                              zws_id = my.zid)
+    
+    # assign zillow response, putative XML data to `xData`
+    xData <- zData$response
+    
+    # if response is NULL: proceed to next Zillow Record (new API call)
+    if(is.null(xData)) next 
+    
+    # else: process XML record into list of XML data
+    xs <- xData[["results"]][["result"]]
+    xs <- xmlSApply(xs, xmlChildren)
+    
+    # parse list of XML data using custom function then send directly to pipeline
+    # to correct data type, convert to data frame, remove unnecessary columns
+    tempRes <- parseXMLList(xs) %>%
+      sapply(detectFixType, simplify=F) %>% 
+      as.data.frame() %>%
+      select(-contains("link")) # get rid of columns not needed
+                                # using `contains` to avoid 
+                                # potential errors on missing cols
+    
+    # add in the HOA data
+    cols_have <- colnames(addr)
+    if('HOA/MONTH' %in% cols_have){
+      tempRes$HOA <- addr$`HOA/MONTH`[i]
+    }
+    else{
+      tempRes$HOA <- NA
+    }
+    if('PRICE' %in% cols_have){
+      tempRes$price <- addr$PRICE[i]
+    }
+    else{
+      tempRes$price <- NA
+    }
+    if('DAYS ON MARKET' %in% cols_have){
+      tempRes$daysOnMarket <- addr$`DAYS ON MARKET`[i]
+    }
+    else{
+      tempRes$daysOnMarket <- NA
+    }
+    
+    # merge temp results to final results data frame
+    res <- plyr::rbind.fill(res, tempRes)               
+  }
+  
+  # fix names in final data frame before returning
+  names(res) <- str_remove(names(res), "\\.")           # remove leading `.` from algorithm
+  res <- res %>%                                        # change/harmonize variable names
+    dplyr::rename(
+      regionName = region.name, 
+      regionType=region.type,
+      street=address.street, 
+      zipcode=address.zipcode, 
+      city=address.city,
+      state=address.state,
+      latitude=address.latitude,
+      longitude=address.longitude,
+      zestimate=zestimate.amount,
+      zestimateLastUpdated=zestimate.last.updated,
+      zestimateChange=zestimate.valueChange,
+      zestimateLow=zestimate.valuationRange.low,
+      zestimateHigh=zestimate.valuationRange.high,
+      zestimatePercentile=zestimate.percentile,
+      rentZestimate=rentzestimate.amount,
+      rentZestimateLastUpdated=rentzestimate.last.updated,
+      rentZestimateChange=rentzestimate.valueChange,
+      rentZestimateLow=rentzestimate.valuationRange.low,
+      rentZestimateHigh=rentzestimate.valuationRange.high,
+      regionZindexValue=localRealEstate.region.zindexValue
+    )
+  
+  # return final data frame
+  res
+}
+```
+
+# Run Query
+
+#Uncomment to run. Comments are left in by default as like a safety from accidentally wasting API call
+
+```{r}
+# # for troubleshooting individual calls -- just calling the main ZillowR workhorse function...
+
+# test.result = GetDeepSearchResults(address = a.test$ADDRESS[1],
+#                               citystatezip = a.test$`ZIP OR POSTAL CODE`[1],
+#                               rentzestimate=T,
+#                               zws_id = my.zid)
+```
+
+
+
+
+```{r}
+result <- getZillowData(a.data)
+
+# result = getZillowData(a.test)
+```
+
+# Save Result
+
+```{r}
+thisday <- strftime(today(), "%Y-%m-%d")
+outfilename <- paste(c("ZillowAPIQuery_", thisday, "_.csv"), sep="", collapse="")
+write_csv(result, outfilename)
+```
